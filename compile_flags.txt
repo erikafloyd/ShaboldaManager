@@ -1,0 +1,5 @@
+-IC:/vcpkg/installed/x64-mingw-static/include/
+-Iapi/json/include
+
+
+

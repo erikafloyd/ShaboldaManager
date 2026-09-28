@@ -1,0 +1,138 @@
+#include "backend_encryption.h"
+#include "sodium/crypto_pwhash.h"
+#include "sodium/crypto_secretbox.h"
+#include "sodium/randombytes.h"
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sodium.h>
+
+// для unsigned char мы юзаем sizeof()
+// для char мы юзаем strlen();
+// ПРИ УЧЁТЕ ЧТО У ОБОИХ ДО КОМПИЛЯЦИИ ИЗВЕСТЕН РАЗМЕР МАССИВА
+// а именно: char piska[32], это правильно.
+// int hueglot = 32 + 16;
+// char piska[hueglot] неправильно нихуя. hueglot высчитывается во время
+// исполнения кода, поэтму мы не можем задать его как размер массива впринципе.
+
+// ИИшная версия:
+// 1. Для unsigned char мы юзаем sizeof() - 1, ЕСЛИ это строка в кавычках
+// ("123")! Потому что "123" в памяти — это [1, 2, 3, \0]. sizeof вернет 4, а
+// для crypto_pwhash нужно 3.
+// 2. Для char мы юзаем strlen(), ОН САМ игнорирует \0, тут вычитать единицу НЕ
+// НАДО. ПРИ УЧЁТЕ ЧТО У ОБОИХ ДО КОМПИЛЯЦИИ ИЗВЕСТЕН РАЗМЕР МАССИВА а именно:
+// char piska[32], это правильно.
+
+// int hueglot = 32 + 16;
+// char piska[hueglot] — неправильно нихуя. hueglot высчитывается во время
+// исполнения кода, поэтому мы не можем задать его как размер статического
+// массива в принципе. ЧТОБЫ ЗАРАБОТАЛО: нужно дописать const (а лучше
+// constexpr): constexpr int hueglot = 32 + 16; char piska[hueglot]; // Вот
+// теперь компилятор счастлив, размер известен до компиляции.
+
+unsigned char g_masterKey[32];
+
+bool g_isVaultOpen = false;
+
+int intsodium() {
+  if (sodium_init() < 0)
+    return 1;
+}
+
+std::string encryptPassword(const std::string &rawPassword,
+                            const unsigned char *masterKey) {
+
+  const char *open_text = rawPassword.c_str();
+
+  unsigned char nonce[crypto_secretbox_NONCEBYTES]; // !
+  randombytes_buf(nonce, sizeof(nonce));
+
+  unsigned char cipher_text[strlen(open_text) + 16];
+
+  crypto_secretbox_easy(cipher_text, (const unsigned char *)open_text,
+                        strlen(open_text), nonce, masterKey); // !
+
+  return std::string((const char *)cipher_text, strlen(open_text) + 16);
+}
+
+std::string decryptPassword(const std::string &encryptedPassword,
+                            const std::string &masterPassword) {
+
+  std::string plain_output(strlen(open_text) + 1, '\0');
+
+  // ВАЖНО: Третьим параметром передаем именно РАЗМЕР БИНАРНОГО ШИФРА
+  // (strlen(open_text) + 16), а не текстовый sizeforhex(open_text). ПОЧЕМУ:
+  // sizeforhex возвращает размер текстовой строки (43 байта). Если передать его
+  // сюда, дешифратор подумает, что бинарный шифр длиннее, уйдет читать 22 байта
+  // чужой памяти (системного мусора), упрется в несовпадение защитной печати
+  // (MAC) и вернет ошибку -1. (это я с помощью ИИ вывел, пздц я даун)
+
+  if (crypto_secretbox_open_easy((unsigned char *)plain_output.data(),
+                                 cipher_text, strlen(open_text) + 16, nonce,
+                                 key) == 0) {
+    std::cout << "Text was successfully decrypted! Text: "
+              << (char *)plain_output
+                     .data() // Используем именно c_str(), так как l59
+                             // забивает конец нулями, и компилятор из-за
+                             // этого считывает размер строки неизмеримой.
+              << std::endl;
+  } else {
+    std::cerr << "Wrong key or corrupted data!" << std::endl;
+  }
+  return (char *)plain_output.data();
+}
+
+// для инициализации, когда чел только создаёт базу данных.
+
+bool BackendInitVaultFn(const char *master_password) {
+  unsigned char salt[crypto_pwhash_SALTBYTES];
+  randombytes_buf(salt, sizeof(salt));
+
+  std::ofstream vault(
+      "vault.bin",
+      std::ios::binary); // чтобы виндовс открывал в бинарном режиме
+  if (vault.is_open()) {
+    vault.write((const char *)salt, sizeof(salt));
+    vault.close();
+  } else {
+    return false;
+  }
+  // начинается подготовка для создания мастерключа
+  unsigned long long passwdlen = strlen(
+      master_password); // возможно может поломаться типо не тот сайз выдаст
+
+  if (crypto_pwhash(
+          g_masterKey, sizeof(g_masterKey), master_password,
+          strlen(master_password), salt, crypto_pwhash_OPSLIMIT_INTERACTIVE,
+          crypto_pwhash_MEMLIMIT_INTERACTIVE, crypto_pwhash_ALG_DEFAULT) == 0) {
+    g_isVaultOpen = true;
+    return true;
+  }
+  return false;
+}
+
+// для открывания существующей базы
+
+bool BackendUnlockVaultFn(const char *master_password) {
+  unsigned char db_hash[crypto_pwhash_STRBYTES];
+
+  std::ifstream vault(
+      "vault.bin",
+      std::ios::binary); // чтобы виндовс открывал в бинарном режиме
+  if (vault.is_open()) {
+    vault.read((char *)db_hash, crypto_pwhash_STRBYTES);
+    vault.close();
+  } else {
+    return false;
+  }
+  // начинается подготовка для создания мастерключа
+  unsigned long long passwdlen = strlen(
+      master_password); // возможно может поломаться типо не тот сайз выдаст
+
+  if (crypto_pwhash_str_verify((const char *)db_hash, master_password,
+                               strlen(master_password)) == 0) {
+    g_isVaultOpen = true;
+    return true;
+  }
+  return false;
+}
